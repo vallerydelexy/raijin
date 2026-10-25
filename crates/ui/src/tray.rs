@@ -6,6 +6,8 @@ use raijin_core::platform::tray::{
     CloseDecision, MinimizeDecision, TrayBehavior, WindowVisibility, tray_tooltip,
 };
 
+use crate::downloads::is_transferring;
+
 /// Shared tray session handle (cloneable across views and callbacks).
 ///
 /// All locks guard a single enum/flag copy and are never held across
@@ -27,6 +29,11 @@ pub struct TraySession {
     activity: std::sync::Arc<Mutex<(usize, usize)>>,
     /// Last tooltip text for the 1s tray sync loop (views write, loop reads).
     last_tooltip: std::sync::Arc<Mutex<String>>,
+    /// Set by every window-visibility transition so the 1s tray sync loop
+    /// rebuilds the menu even when the activity flags are unchanged. The
+    /// `has_window` menu row is derived from `App::windows()`, which only the
+    /// sync loop can read without borrowing `App` on every tick.
+    menu_dirty: std::sync::Arc<AtomicBool>,
 }
 
 impl TraySession {
@@ -41,6 +48,7 @@ impl TraySession {
             tray_icon_live: std::sync::Arc::new(AtomicBool::new(false)),
             activity: std::sync::Arc::new(Mutex::new((0, 0))),
             last_tooltip: std::sync::Arc::new(Mutex::new(tray_tooltip("Raijin", 0, 0))),
+            menu_dirty: std::sync::Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -129,10 +137,13 @@ impl TraySession {
     /// can be reused (hide path) vs a full rebuild from monitor + DB
     /// (closed path, see `plan.md` M6 window rule).
     pub fn mark_shown(&self) -> bool {
-        self.visibility
+        let preserved = self
+            .visibility
             .lock()
             .expect("tray visibility lock poisoned")
-            .show()
+            .show();
+        self.menu_dirty.store(true, Ordering::Relaxed);
+        preserved
     }
 
     /// Marks the window destroyed via `remove_window`.
@@ -141,6 +152,15 @@ impl TraySession {
             .lock()
             .expect("tray visibility lock poisoned")
             .close();
+        self.menu_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes a pending window-transition signal.
+    ///
+    /// Lets the tray sync loop rebuild the menu when the window set changed
+    /// without polling `App::windows()` on every tick.
+    pub fn take_menu_dirty(&self) -> bool {
+        self.menu_dirty.swap(false, Ordering::Relaxed)
     }
 
     /// Called from the `on_window_closed` observer (OS chrome close or the
@@ -257,21 +277,26 @@ pub enum OsCloseOutcome {
 /// Returns `(active_count, paused_count, total_speed_bps)`. Pure over the
 /// projected snapshot, so the hidden tray tick can call it without entity
 /// access.
+///
+/// Both counts are read from `active`, because
+/// [`Projection::place_view`](raijin_core::monitor) files every non-terminal
+/// status there; `completed` only ever holds `Completed` and `Error`.
 #[must_use]
 pub fn summarize_monitor(snapshot: &raijin_core::monitor::MonitorState) -> (usize, usize, u64) {
     let mut active = 0usize;
+    let mut paused = 0usize;
     let mut speed = 0u64;
     for view in snapshot.active.values() {
-        if view.status == DownloadStatus::Downloading {
+        // Shares `is_transferring` with `DownloadRow::is_active` so the tooltip
+        // and the "Pause all" row agree whether the window is open or hidden.
+        if is_transferring(view.status) {
             active += 1;
+        }
+        if view.status == DownloadStatus::Paused {
+            paused += 1;
         }
         speed = speed.saturating_add(view.speed.get());
     }
-    let paused = snapshot
-        .completed
-        .values()
-        .filter(|view| view.status == DownloadStatus::Paused)
-        .count();
     (active, paused, speed)
 }
 
@@ -464,6 +489,23 @@ mod tests {
     }
 
     #[test]
+    fn window_transitions_should_signal_a_menu_rebuild() {
+        let tray = session();
+        assert!(!tray.take_menu_dirty(), "a fresh session is clean");
+
+        tray.note_hidden_to_tray();
+        assert!(!tray.take_menu_dirty(), "an in-place hide keeps the window");
+
+        tray.mark_closed();
+        assert!(tray.take_menu_dirty(), "a destroyed window changes the menu");
+        assert!(!tray.take_menu_dirty(), "the signal is consumed once");
+
+        tray.mark_shown();
+        assert!(tray.take_menu_dirty(), "a reopened window changes the menu");
+        assert!(!tray.take_menu_dirty());
+    }
+
+    #[test]
     fn session_should_apply_settings_behavior() {
         let tray = session();
         tray.set_behavior(TrayBehavior::new(false, false));
@@ -593,18 +635,74 @@ mod tests {
                 updated_at: now,
             },
         );
+        // Non-terminal statuses live in `active` (see `Projection::place_view`),
+        // so `Paused`, `Retrying` and `PreparingFile` must be seeded here.
+        active.insert(
+            DownloadId::new(3),
+            DownloadView {
+                id: DownloadId::new(3),
+                url: "https://example.com/c.zip".to_owned(),
+                file_name: "c.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::Paused,
+                downloaded_bytes: Bytes::new(5),
+                total_bytes: Some(Bytes::new(50)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        active.insert(
+            DownloadId::new(4),
+            DownloadView {
+                id: DownloadId::new(4),
+                url: "https://example.com/d.zip".to_owned(),
+                file_name: "d.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::Retrying,
+                downloaded_bytes: Bytes::new(7),
+                total_bytes: Some(Bytes::new(70)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        active.insert(
+            DownloadId::new(5),
+            DownloadView {
+                id: DownloadId::new(5),
+                url: "https://example.com/e.zip".to_owned(),
+                file_name: "e.zip".to_owned(),
+                folder: std::path::PathBuf::from("C:/Downloads"),
+                status: DownloadStatus::PreparingFile,
+                downloaded_bytes: Bytes::ZERO,
+                total_bytes: Some(Bytes::new(90)),
+                speed: BytesPerSecond::ZERO,
+                eta_seconds: None,
+                active_part_count: 0,
+                failure: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
         let snapshot = MonitorState {
             active,
             completed: std::collections::BTreeMap::from([(
-                DownloadId::new(3),
+                DownloadId::new(6),
                 DownloadView {
-                    id: DownloadId::new(3),
-                    url: "https://example.com/c.zip".to_owned(),
-                    file_name: "c.zip".to_owned(),
+                    id: DownloadId::new(6),
+                    url: "https://example.com/f.zip".to_owned(),
+                    file_name: "f.zip".to_owned(),
                     folder: std::path::PathBuf::from("C:/Downloads"),
-                    status: DownloadStatus::Paused,
-                    downloaded_bytes: Bytes::new(5),
-                    total_bytes: Some(Bytes::new(50)),
+                    status: DownloadStatus::Completed,
+                    downloaded_bytes: Bytes::new(100),
+                    total_bytes: Some(Bytes::new(100)),
                     speed: BytesPerSecond::ZERO,
                     eta_seconds: None,
                     active_part_count: 0,
@@ -615,7 +713,9 @@ mod tests {
             )]),
         };
 
-        assert_eq!(summarize_monitor(&snapshot), (2, 1, 3072));
+        // 2 downloading + retrying + preparing counts as transferring; the
+        // completed entry contributes nothing to any counter or speed.
+        assert_eq!(summarize_monitor(&snapshot), (4, 1, 3072));
         assert_eq!(summarize_monitor(&MonitorState::default()), (0, 0, 0));
     }
 }

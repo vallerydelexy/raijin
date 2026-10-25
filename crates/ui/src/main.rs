@@ -26,9 +26,10 @@ mod tray;
 
 use std::time::Duration;
 
-use gpui_kit::component::{Root, Theme, ThemeMode, TitleBar};
+use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 use raijin_core::integration::DEFAULT_PORT;
+use raijin_core::platform::deeplink::{ProtocolAction, parse_protocol_args, set_registered};
 use raijin_core::platform::tray::CloseDecision;
 
 use crate::add_download::open_add_download_window;
@@ -55,12 +56,36 @@ gpui_kit::actions!(
     ]
 );
 
+fn startup_failed(context: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("{}", raijin_core::logging::record_fatal(context, error));
+    std::process::exit(1);
+}
+
 fn main() {
     // The GUI binary has no console (GUI subsystem), so routine logging goes
     // to a file in debug builds and every crash goes to `crash.log`.
     raijin_core::logging::install_panic_hook();
     raijin_core::logging::init_app_tracing();
     let args: Vec<String> = std::env::args().collect();
+    let protocol_action = parse_protocol_args(&args)
+        .unwrap_or_else(|error| startup_failed("invalid app link arguments", error));
+    if let Some(action @ (ProtocolAction::Register | ProtocolAction::Unregister)) = protocol_action
+    {
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| startup_failed("could not locate Raijin executable", error));
+        set_registered(&executable, action == ProtocolAction::Register)
+            .unwrap_or_else(|error| startup_failed("protocol registration failed", error));
+        tracing::info!(?action, "protocol registration command completed");
+        return;
+    }
+    let open_integration = protocol_action == Some(ProtocolAction::OpenSettings);
+    #[cfg(not(windows))]
+    if open_integration {
+        startup_failed(
+            "app links are currently supported only on Windows",
+            "unsupported platform",
+        );
+    }
     let start_minimized = parse_start_minimized(args.iter().cloned());
     let start_from_autostart = parse_start_from_autostart(args.iter().cloned());
     // Standalone Add Download entry (browser-extension catch without the
@@ -78,6 +103,34 @@ fn main() {
             );
             std::process::exit(1);
         });
+    #[cfg(windows)]
+    let mut instance = {
+        use raijin_core::platform::instance::{DesktopCommand, claim};
+        let command = if open_integration {
+            DesktopCommand::BrowserIntegration
+        } else if let Some(url) = &add_url {
+            DesktopCommand::Add(url.clone())
+        } else if start_minimized || start_from_autostart {
+            DesktopCommand::Background
+        } else {
+            DesktopCommand::Activate
+        };
+        let data_dir = raijin_core::platform::app_data_dir().unwrap_or_else(|error| {
+            startup_failed("could not resolve instance data directory", error)
+        });
+        match runtime
+            .block_on(claim(&data_dir, &command))
+            .unwrap_or_else(|error| {
+                startup_failed("could not claim or contact the desktop instance", error)
+            }) {
+            Some(instance) => instance,
+            None => return,
+        }
+    };
+    #[cfg(windows)]
+    let instance_receiver = instance
+        .take_receiver()
+        .expect("new instance owns a receiver");
     let (handles, tray, integration, settings) = runtime
         .block_on(bootstrap_engine())
         .unwrap_or_else(|error| {
@@ -159,6 +212,14 @@ fn main() {
                 }
             };
             register_tray_actions(cx, &handles, &tray, &settings, native_tray.clone());
+            #[cfg(windows)]
+            crate::bridge::spawn_launch_dispatcher(
+                cx,
+                instance_receiver,
+                handles.clone(),
+                tray.clone(),
+                settings.clone(),
+            );
             // Browser-extension requests arrive over localhost; the dispatcher
             // stays on this thread and only hands work to the engine runtime.
             if let Some(started) = integration {
@@ -166,11 +227,14 @@ fn main() {
                 crate::integration_bridge::spawn_dispatcher(
                     cx,
                     started,
-                    Box::new(move |cx, prepared| {
-                        // One dialog per item keeps the existing single-URL
-                        // form unchanged; batches are rare from the extension.
+                    Box::new(move |cx, prepared, pending| {
                         for item in prepared {
-                            open_add_download_window(cx, &dialog_handles, &item.source.link);
+                            crate::add_download::open_integration_download_window(
+                                cx,
+                                &dialog_handles,
+                                item,
+                                pending.clone(),
+                            );
                         }
                     }),
                 );
@@ -194,7 +258,9 @@ fn main() {
             // extension-caught link needs no main-window cost. An explicit
             // `--add` wins over `--minimized`. Closing the Add window falls
             // back to tray (or reopens main when no icon is live).
-            if let Some(url) = add_url.clone() {
+            if open_integration {
+                crate::settings::open_browser_integration(cx, &settings);
+            } else if let Some(url) = add_url.clone() {
                 let handles = handles.clone();
                 cx.spawn(async move |cx| {
                     cx.update(|cx| open_add_download_window(cx, &handles, &url));
@@ -207,7 +273,7 @@ fn main() {
                     cx.update(|cx| {
                         let options = main_window_options(cx);
                         cx.open_window(options, |window, cx| {
-                            build_main_root(
+                            build_main_view(
                                 window,
                                 cx,
                                 handles.clone(),
@@ -411,7 +477,10 @@ fn spawn_tray_sync(cx: &mut App, icon: gpui_tray::Tray, session: TraySession) {
             let tooltip = session.last_tooltip();
             let flags = (session.has_active(), session.has_paused());
             let tooltip_changed = tooltip != last_tooltip;
-            let menu_changed = flags != last_flags;
+            // `has_window` is read by the menu builder, which already holds
+            // `App`; the session only reports that a transition happened, so
+            // this loop never borrows `App` while nothing changed.
+            let menu_changed = flags != last_flags || session.take_menu_dirty();
             if tooltip_changed {
                 last_tooltip = tooltip;
             }
@@ -449,7 +518,7 @@ fn open_main_window(
     let root_tray = tray.clone();
     let root_settings = settings.clone();
     match cx.open_window(main_window_options(cx), |window, cx| {
-        build_main_root(
+        build_main_view(
             window,
             cx,
             root_handles.clone(),
@@ -477,20 +546,19 @@ fn main_window_options(cx: &App) -> WindowOptions {
     options
 }
 
-/// Builds the main window root view and wires the close veto.
+/// Builds the main window view and wires the close veto.
 ///
 /// Every opened main window (initial + rebuilds) goes through here so the
 /// close behavior stays identical across the app lifetime.
-fn build_main_root(
+fn build_main_view(
     window: &mut Window,
     cx: &mut App,
     handles: EngineHandles,
     session: TraySession,
     settings: SettingsHandles,
-) -> Entity<Root> {
+) -> Entity<MainView> {
     register_should_close(window, cx, &session);
-    let view = cx.new(|cx| MainView::new(window, cx, handles, session, settings));
-    cx.new(|cx| Root::new(view, window, cx))
+    cx.new(|cx| MainView::new(window, cx, handles, session, settings))
 }
 
 /// Vetoes the OS close for tray hides (X, Alt+F4, taskbar close) and converts
@@ -577,7 +645,7 @@ fn tray_icon_rgba() -> Vec<u8> {
 /// `HICON` / SNI pixmap / `NSImage`.
 fn tray_icon() -> gpui_tray::Result<gpui_tray::Icon> {
     const SIZE: u32 = 32;
-    gpui_tray::Icon::from_rgba(tray_icon_rgba(), SIZE, SIZE)
+    gpui_tray::Icon::from_rgba(tray_icon_rgba(), SIZE, SIZE).build()
 }
 
 /// Bootstraps persistence, settings, the download manager actor, and the monitor.
